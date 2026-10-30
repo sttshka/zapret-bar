@@ -1,0 +1,364 @@
+diff --git a/tpws/fake.c b/tpws/fake.c
+new file mode 100644
+index 0000000..6a68fa0
+--- /dev/null
++++ b/tpws/fake.c
+@@ -0,0 +1,174 @@
++// Fake TLS ClientHello injection for macOS (ZapretBar).
++//
++// macOS has no divert sockets, so nfqws-style "fake" desync is impossible there.
++// Instead we write a crafted TCP segment straight to the link layer via /dev/bpf
++// right before tpws sends the real ClientHello. The fake carries an allowed SNI
++// (www.google.com) and random seq/ack: DPI accepts it as the flow's first payload,
++// the server discards it as out-of-window. Verified on RU TSPU (Cloudflare 16KB freeze
++// and SNI block) with scripts/fake-test.py.
++
++#include "fake.h"
++
++#ifdef __APPLE__
++
++#include <errno.h>
++#include <fcntl.h>
++#include <net/bpf.h>
++#include <net/if.h>
++#include <netinet/in.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/ioctl.h>
++#include <sys/socket.h>
++#include <unistd.h>
++#include <arpa/inet.h>
++
++#include "helpers.h"
++#include "params.h"
++
++static int bpf_fd = -1;
++static uint8_t eth_hdr[14];
++
++static bool parse_mac(const char *s, uint8_t *mac)
++{
++	unsigned int m[6];
++	if (sscanf(s, "%x:%x:%x:%x:%x:%x", &m[0], &m[1], &m[2], &m[3], &m[4], &m[5]) != 6) return false;
++	for (int i = 0; i < 6; i++) mac[i] = (uint8_t)m[i];
++	return true;
++}
++
++bool fake_init(const char *iface, const char *src_mac, const char *gw_mac)
++{
++	uint8_t smac[6], dmac[6];
++	struct ifreq ifr;
++	unsigned int one = 1;
++	char dev[16];
++
++	if (!parse_mac(src_mac, smac) || !parse_mac(gw_mac, dmac))
++	{
++		DLOG_ERR("fake: bad mac address\n");
++		return false;
++	}
++	for (int i = 0; i < 256 && bpf_fd == -1; i++)
++	{
++		snprintf(dev, sizeof(dev), "/dev/bpf%d", i);
++		bpf_fd = open(dev, O_WRONLY);
++		if (bpf_fd == -1 && errno != EBUSY && errno != ENOENT && errno != EACCES && errno != EPERM) break;
++	}
++	if (bpf_fd == -1)
++	{
++		DLOG_PERROR("fake: open /dev/bpf");
++		return false;
++	}
++	memset(&ifr, 0, sizeof(ifr));
++	snprintf(ifr.ifr_name, sizeof(ifr.ifr_name), "%s", iface);
++	if (ioctl(bpf_fd, BIOCSETIF, &ifr) == -1 || ioctl(bpf_fd, BIOCSHDRCMPLT, &one) == -1)
++	{
++		DLOG_PERROR("fake: bpf ioctl");
++		close(bpf_fd);
++		bpf_fd = -1;
++		return false;
++	}
++	memcpy(eth_hdr, dmac, 6);
++	memcpy(eth_hdr + 6, smac, 6);
++	eth_hdr[12] = 0x08; eth_hdr[13] = 0x00;
++	DLOG_CONDUP("fake: injecting via %s (/dev/%s)\n", iface, dev + 5);
++	return true;
++}
++
++bool fake_available(void)
++{
++	return bpf_fd != -1;
++}
++
++static uint16_t csum_fold(uint32_t s)
++{
++	while (s >> 16) s = (s & 0xFFFF) + (s >> 16);
++	return (uint16_t)~s;
++}
++
++static uint32_t csum_add(uint32_t s, const uint8_t *p, size_t len)
++{
++	for (; len > 1; p += 2, len -= 2) s += (uint32_t)p[0] << 8 | p[1];
++	if (len) s += (uint32_t)p[0] << 8;
++	return s;
++}
++
++bool fake_send(int fd, const uint8_t *payload, size_t len, int repeats, bool md5sig)
++{
++	struct sockaddr_storage ls, rs;
++	socklen_t sl = sizeof(ls), rl = sizeof(rs);
++	uint8_t frame[1600], *ip, *tcp;
++	size_t optlen = md5sig ? 20 : 0, thl = 20 + optlen, total;
++	uint32_t s;
++
++	if (bpf_fd == -1 || !payload || !len) return false;
++	if (getsockname(fd, (struct sockaddr *)&ls, &sl) == -1 || getpeername(fd, (struct sockaddr *)&rs, &rl) == -1) return false;
++	// IPv6 is not handled yet: no fake, connection proceeds as usual.
++	if (ls.ss_family != AF_INET || rs.ss_family != AF_INET) return false;
++	total = 20 + thl + len;
++	if (14 + total > sizeof(frame)) return false;
++
++	const struct sockaddr_in *l4 = (struct sockaddr_in *)&ls, *r4 = (struct sockaddr_in *)&rs;
++	memset(frame, 0, 14 + total);
++	memcpy(frame, eth_hdr, 14);
++
++	ip = frame + 14;
++	ip[0] = 0x45;
++	ip[2] = (uint8_t)(total >> 8); ip[3] = (uint8_t)total;
++	uint16_t id = (uint16_t)arc4random();
++	ip[4] = (uint8_t)(id >> 8); ip[5] = (uint8_t)id;
++	ip[6] = 0x40; // DF
++	ip[8] = 64;   // ttl
++	ip[9] = IPPROTO_TCP;
++	memcpy(ip + 12, &l4->sin_addr, 4);
++	memcpy(ip + 16, &r4->sin_addr, 4);
++	s = csum_fold(csum_add(0, ip, 20));
++	ip[10] = (uint8_t)(s >> 8); ip[11] = (uint8_t)s;
++
++	tcp = ip + 20;
++	memcpy(tcp, &l4->sin_port, 2);
++	memcpy(tcp + 2, &r4->sin_port, 2);
++	uint32_t seq = arc4random(), ack = arc4random();
++	for (int i = 0; i < 4; i++)
++	{
++		tcp[4 + i] = (uint8_t)(seq >> (24 - 8 * i));
++		tcp[8 + i] = (uint8_t)(ack >> (24 - 8 * i));
++	}
++	tcp[12] = (uint8_t)((thl / 4) << 4);
++	tcp[13] = 0x18; // PSH|ACK
++	tcp[14] = 0x04; tcp[15] = 0x00; // window 1024
++	if (md5sig)
++	{
++		// TCP MD5 signature option (kind 19, len 18) + 2 NOP. Servers drop segments carrying it.
++		tcp[20] = 19; tcp[21] = 18;
++		tcp[38] = 1; tcp[39] = 1;
++	}
++	memcpy(tcp + thl, payload, len);
++
++	uint8_t pseudo[12];
++	memcpy(pseudo, ip + 12, 8);
++	pseudo[8] = 0; pseudo[9] = IPPROTO_TCP;
++	pseudo[10] = (uint8_t)((thl + len) >> 8); pseudo[11] = (uint8_t)(thl + len);
++	s = csum_fold(csum_add(csum_add(0, pseudo, 12), tcp, thl + len));
++	tcp[16] = (uint8_t)(s >> 8); tcp[17] = (uint8_t)s;
++
++	for (int i = 0; i < repeats; i++)
++	{
++		if (write(bpf_fd, frame, 14 + total) == -1)
++		{
++			DLOG_PERROR("fake: bpf write");
++			return false;
++		}
++	}
++	return true;
++}
++
++#else
++
++bool fake_init(const char *iface, const char *src_mac, const char *gw_mac) { return false; }
++bool fake_available(void) { return false; }
++bool fake_send(int fd, const uint8_t *payload, size_t len, int repeats, bool md5sig) { return false; }
++
++#endif
+diff --git a/tpws/fake.h b/tpws/fake.h
+new file mode 100644
+index 0000000..485791a
+--- /dev/null
++++ b/tpws/fake.h
+@@ -0,0 +1,10 @@
++#pragma once
++
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++
++// Fake TLS ClientHello injection via /dev/bpf (macOS only, see fake.c).
++bool fake_init(const char *iface, const char *src_mac, const char *gw_mac);
++bool fake_available(void);
++bool fake_send(int fd, const uint8_t *payload, size_t len, int repeats, bool md5sig);
+diff --git a/tpws/params.h b/tpws/params.h
+index a0f2a11..decb3f0 100644
+--- a/tpws/params.h
++++ b/tpws/params.h
+@@ -53,6 +53,12 @@ struct desync_profile
+ 	bool oob, oob_http, oob_tls;
+ 	uint8_t oob_byte;
+ 
++	// fake ClientHello injection (macOS, see fake.c)
++	uint8_t *fake_tls;
++	size_t fake_tls_size;
++	int fake_repeats;
++	bool fake_md5sig;
++
+ 	// multisplit
+ 	struct proto_pos splits[MAX_SPLITS];
+ 	int split_count;
+diff --git a/tpws/tamper.c b/tpws/tamper.c
+index 8e91756..d4382a7 100644
+--- a/tpws/tamper.c
++++ b/tpws/tamper.c
+@@ -505,6 +505,7 @@ void tamper_out(t_ctrack *ctrack, const struct sockaddr *dest, uint8_t *segment,
+ 			{
+ 				if (ctrack->dp->disorder_tls) *split_flags |= SPLIT_FLAG_DISORDER;
+ 				if (ctrack->dp->oob_tls) *split_flags |= SPLIT_FLAG_OOB;
++				if (ctrack->dp->fake_tls) *split_flags |= SPLIT_FLAG_FAKE;
+ 			}
+ 			break;
+ 
+diff --git a/tpws/tamper.h b/tpws/tamper.h
+index 5b5aabf..7572661 100644
+--- a/tpws/tamper.h
++++ b/tpws/tamper.h
+@@ -8,6 +8,7 @@
+ 
+ #define SPLIT_FLAG_DISORDER	0x01
+ #define SPLIT_FLAG_OOB		0x02
++#define SPLIT_FLAG_FAKE		0x04
+ 
+ typedef struct
+ {
+diff --git a/tpws/tpws.c b/tpws/tpws.c
+index 69e6d39..ca3d5da 100644
+--- a/tpws/tpws.c
++++ b/tpws/tpws.c
+@@ -31,6 +31,7 @@
+ #include <ifaddrs.h>
+ #endif
+ 
++#include "fake.h"
+ #include "tpws.h"
+ 
+ #ifdef BSD
+@@ -263,6 +264,12 @@ static void exithelp(void)
+ #endif
+ 		" --oob[=http|tls]\t\t\t; when splitting send out of band byte. default is HEX 0x00.\n"
+ 		" --oob-data=<char>|0xHEX\t\t; override default 0x00 OOB byte.\n"
++#ifdef __APPLE__
++		" --fake-tls=<filename>\t\t\t; inject fake ClientHello from file before real one (needs --fake-link)\n"
++		" --fake-repeats=<int>\t\t\t; send fake N times (default 6)\n"
++		" --fake-md5sig\t\t\t\t; add TCP MD5 option to fake so server drops it\n"
++		" --fake-link=<iface>,<src_mac>,<gw_mac> ; link layer for fake injection via /dev/bpf\n"
++#endif
+ 		" --hostcase\t\t\t\t; change Host: => host:\n"
+ 		" --hostspell\t\t\t\t; exact spelling of \"Host\" header. must be 4 chars. default is \"host\"\n"
+ 		" --hostdot\t\t\t\t; add \".\" after Host: name\n"
+@@ -669,6 +676,10 @@ enum opt_indices {
+ 	IDX_DISORDER,
+ 	IDX_OOB,
+ 	IDX_OOB_DATA,
++	IDX_FAKE_TLS,
++	IDX_FAKE_REPEATS,
++	IDX_FAKE_MD5SIG,
++	IDX_FAKE_LINK,
+ 	IDX_METHODSPACE,
+ 	IDX_METHODEOL,
+ 	IDX_HOSTTAB,
+@@ -762,6 +773,10 @@ static const struct option long_options[] = {
+ 	[IDX_DISORDER] = {"disorder", optional_argument, 0, 0},
+ 	[IDX_OOB] = {"oob", optional_argument, 0, 0},
+ 	[IDX_OOB_DATA] = {"oob-data", required_argument, 0, 0},
++	[IDX_FAKE_TLS] = {"fake-tls", required_argument, 0, 0},
++	[IDX_FAKE_REPEATS] = {"fake-repeats", required_argument, 0, 0},
++	[IDX_FAKE_MD5SIG] = {"fake-md5sig", no_argument, 0, 0},
++	[IDX_FAKE_LINK] = {"fake-link", required_argument, 0, 0},
+ 	[IDX_METHODSPACE] = {"methodspace", no_argument, 0, 0},
+ 	[IDX_METHODEOL] = {"methodeol", no_argument, 0, 0},
+ 	[IDX_HOSTTAB] = {"hosttab", no_argument, 0, 0},
+@@ -1161,6 +1176,44 @@ void parse_params(int argc, char *argv[])
+ 				else dp->oob_byte = (uint8_t)bt;
+ 			}
+ 			break;
++		case IDX_FAKE_TLS:
++			{
++				FILE *F = fopen(optarg, "rb");
++				uint8_t b[1400];
++				size_t n = F ? fread(b, 1, sizeof(b), F) : 0;
++				if (F) fclose(F);
++				if (!n || !(dp->fake_tls = malloc(n)))
++				{
++					DLOG_ERR("could not load fake from %s\n", optarg);
++					exit_clean(1);
++				}
++				memcpy(dp->fake_tls, b, n);
++				dp->fake_tls_size = n;
++				if (!dp->fake_repeats) dp->fake_repeats = 6;
++				params.tamper = true;
++			}
++			break;
++		case IDX_FAKE_REPEATS:
++			dp->fake_repeats = atoi(optarg);
++			if (dp->fake_repeats < 1 || dp->fake_repeats > 20)
++			{
++				DLOG_ERR("fake-repeats must be 1..20\n");
++				exit_clean(1);
++			}
++			break;
++		case IDX_FAKE_MD5SIG:
++			dp->fake_md5sig = true;
++			break;
++		case IDX_FAKE_LINK:
++			{
++				char iface[IF_NAMESIZE], smac[18], gmac[18];
++				if (sscanf(optarg, "%15[^,],%17[^,],%17s", iface, smac, gmac) != 3 || !fake_init(iface, smac, gmac))
++				{
++					DLOG_ERR("could not set up fake injection with --fake-link=%s\n", optarg);
++					exit_clean(1);
++				}
++			}
++			break;
+ 		case IDX_METHODSPACE:
+ 			dp->methodspace = true;
+ 			params.tamper = true;
+diff --git a/tpws/tpws_conn.c b/tpws/tpws_conn.c
+index f74952a..b1de8de 100644
+--- a/tpws/tpws_conn.c
++++ b/tpws/tpws_conn.c
+@@ -24,6 +24,7 @@
+ #include "tpws_conn.h"
+ #include "redirect.h"
+ #include "tamper.h"
++#include "fake.h"
+ #include "socks.h"
+ #include "helpers.h"
+ #include "hostlist.h"
+@@ -1122,6 +1123,7 @@ static bool in_tamper_out_range(tproxy_conn_t *conn)
+ static void tamper(tproxy_conn_t *conn, uint8_t *segment, size_t segment_buffer_size, size_t *segment_size, size_t *multisplit_pos, int *multisplit_count, uint8_t *split_flags)
+ {
+ 	if (multisplit_count) *multisplit_count=0;
++	if (split_flags) *split_flags=0;
+ 	if (params.tamper)
+ 	{
+ 		if (conn->remote)
+@@ -1273,6 +1275,14 @@ static bool handle_epoll(tproxy_conn_t *conn, struct tailhead *conn_list, uint32
+ 				conn->tnrd++;
+ 				conn->trd+=rd;
+ 
++				if ((split_flags & SPLIT_FLAG_FAKE) && conn->track.dp)
++				{
++					// Fake ClientHello goes to the wire before the real one: DPI judges the flow by it.
++					VPRINT("Injecting fake ClientHello x%d%s\n", conn->track.dp->fake_repeats, conn->track.dp->fake_md5sig ? " with md5sig" : "");
++					if (!fake_send(conn->partner->fd, conn->track.dp->fake_tls, conn->track.dp->fake_tls_size, conn->track.dp->fake_repeats, conn->track.dp->fake_md5sig))
++						VPRINT("fake injection failed\n");
++				}
++
+ 				if (multisplit_count)
+ 				{
+ 					ssize_t from,to,len;
